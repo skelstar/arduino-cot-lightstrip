@@ -1,6 +1,12 @@
+
 #include <Wire.h>
 #include <ArduinoNunchuk.h>
 
+#include <ESP8266WiFi.h>
+#include <WiFiUdp.h>
+
+#include <Time.h>
+#include <TimeLib.h>
 
 #include <LPD8806.h>
 #include "SPI.h"
@@ -67,7 +73,7 @@ bool analogOffAxis_old = false;
 #define   STATE_DEFAULT     STATE_IDLE
 
 #define   LOOP_DELAYms      100
-#define   LIGHTS_ON_PERIOD   60 * 10
+#define   LIGHTS_ON_SECONDS   5
 
 int state;
 int next;
@@ -114,7 +120,7 @@ void loop() {
     currentBrightness = stripFadeUp(currentBrightness, BRIGHTNESS_ON);
     if (currentBrightness == BRIGHTNESS_ON) {
       changeStateToThen(STATE_ON, STATE_ON);
-      onCounter = 0;
+      setTime(hour(), minute(), 0, day(), month(), year());
     }
 
     if (zButtonPressDownEvent()) {
@@ -133,13 +139,16 @@ void loop() {
     if (zButtonPressDownEvent()) {
       changeStateToThen(STATE_FADING_DOWN, STATE_DEFAULT);
     } else {
-      onCounter++;
-      if (onCounter >= LIGHTS_ON_PERIOD)
+      if (second() > LIGHTS_ON_SECONDS)
         changeStateToThen(STATE_FADING_DOWN, STATE_DEFAULT);
     }
   }
 
   //chuckDebug();
+  
+
+  if (hour() >= 12)
+    changeStateToThen(STATE_OFF, STATE_OFF);
 
   delay(LOOP_DELAYms);
   loopCounter++;
