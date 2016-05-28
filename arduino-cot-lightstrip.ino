@@ -1,27 +1,43 @@
+#include <Time.h>
+#include <TimeLib.h>
+#include <EEPROM.h>
 
 #include <Wire.h>
 #include <ArduinoNunchuk.h>
 
-#include <ESP8266WiFi.h>
-#include <WiFiUdp.h>
-
-#include <Time.h>
-#include <TimeLib.h>
-
-#include <LPD8806.h>
+#include "LPD8806.h"
 #include "SPI.h"
 
+#include <Ticker.h>
 
-#include <Adafruit_NeoPixel.h>
 #ifdef __AVR__
   #include <avr/power.h>
 #endif
 
-// --- esp 8266 ---
+// Watchdog / EEPROM
 
-#define SSID "Leila2Net"       
-#define PASS "ec1122%f*&"   
-#define DST_IP "192.168.0.1" 
+int eeStateAddr = 0;
+int eeNextStateAddr = 1;
+int eeCurrBrightnessAddr = 2;
+
+static unsigned long last_loop;
+
+Ticker tickerOSWatch;
+
+#define ONE_MINUTE  60
+#define OSWATCH_RESET_TIME_SECONDS      5 * ONE_MINUTE        // in seconds
+
+// callback to be called when Ticker period trigger
+void ICACHE_RAM_ATTR osWatchCallback(void) {
+  unsigned long t = millis();
+  unsigned long last_run = abs(t - last_loop);
+  //if (last_run >= ( OSWATCH_RESET_TIME_SECONDS * 1000)) {
+    // save the hit here to eeprom or to rtc memory if needed
+    ESP.restart();  // normal reboot 
+    //ESP.reset();  // hard reset
+  //}
+}
+
 
 // ----- strip -----
 
@@ -33,12 +49,15 @@
 
 LPD8806 strip = LPD8806(nLEDs, dataPin, clkPin);
 
-#define   BRIGHTNESS_1    1   // 1 == 2mA/8 (16mA for 62)
+#define   BRIGHTNESS_1    2   // 1 == 2mA/8 (16mA for 62)
 #define   BRIGHTNESS_12   12  // 12 == 12mA/8 (93 mA for 62)
 #define   BRIGHTNESS_24   24  // 24 == 23mA/8 (178mA for 62)
 
+#define BRIGHTNESS_OFF    0
 #define BRIGHTNESS_IDLE   BRIGHTNESS_1
 #define BRIGHTNESS_ON     BRIGHTNESS_24
+
+#define BRIGHTNESS_DEFAULT  BRIGHTNESS_IDLE
 
 int currentBrightness = 0;
 
@@ -46,7 +65,7 @@ int currentBrightness = 0;
 
 // ---- WiiChuck -----
 ArduinoNunchuk nunchuk = ArduinoNunchuk();
-#define pwrpin  
+
 int zButton_old;
 bool analogOffAxis_old = false;
 
@@ -70,13 +89,17 @@ bool analogOffAxis_old = false;
 #define   STATE_FADING_UP   3
 #define   STATE_FADING_DOWN 4
 
-#define   STATE_DEFAULT     STATE_IDLE
+#define   STATE_MAX_STATE  4
+
+#define   STATE_DEFAULT     STATE_OFF
 
 #define   LOOP_DELAYms      100
-#define   LIGHTS_ON_SECONDS   5
+#define   LIGHTS_ON_PERIOD   60 * 10
 
+int last;
 int state;
 int next;
+int targetBrightness;
 int loopCounter;
 int onCounter = 0;
 
@@ -94,7 +117,14 @@ void setup() {
 
   nunchuk.init();
 
-  changeStateToThen(STATE_DEFAULT, STATE_DEFAULT);
+  EEPROM.begin(4);
+
+  RestoreFromEEPROM();
+
+  changeStateToThen(state, next);
+
+  last_loop = millis();
+  tickerOSWatch.attach_ms(OSWATCH_RESET_TIME_SECONDS * 1000, osWatchCallback);
 }
 
 void loop() {
@@ -104,7 +134,7 @@ void loop() {
 
   if (state == STATE_OFF) {
     if (zButtonPressDownEvent()) {
-      changeStateToThen(STATE_FADING_UP, STATE_ON);
+      changeStateToThen(STATE_FADING_UP, STATE_IDLE);
     }
   }
 
@@ -112,52 +142,68 @@ void loop() {
     currentBrightness = BRIGHTNESS_IDLE;
 
     if (zButtonPressDownEvent()) {
-      changeStateToThen(STATE_FADING_UP, STATE_ON);
+      if (last == STATE_FADING_DOWN) {
+        changeStateToThen(STATE_FADING_DOWN, STATE_OFF);
+      } else if (last == STATE_FADING_UP) {
+        changeStateToThen(STATE_FADING_UP, STATE_ON);
+      } else {
+        changeStateToThen(STATE_FADING_UP, STATE_ON);
+      }
     }
   }
 
   if (state == STATE_FADING_UP) {
-    currentBrightness = stripFadeUp(currentBrightness, BRIGHTNESS_ON);
-    if (currentBrightness == BRIGHTNESS_ON) {
-      changeStateToThen(STATE_ON, STATE_ON);
-      setTime(hour(), minute(), 0, day(), month(), year());
-    }
-
-    if (zButtonPressDownEvent()) {
-      changeStateToThen(STATE_FADING_DOWN, STATE_DEFAULT);
+    currentBrightness = stripFadeFromTo(currentBrightness, stateBrightness(next));
+    if (currentBrightness == stateBrightness(next)) {
+      changeStateToThen(next, next);
+      onCounter = 0;
     }
   }
 
   if (state == STATE_FADING_DOWN) {
-    currentBrightness = stripFadeDown(currentBrightness);
-    if (currentBrightness == BRIGHTNESS_IDLE) {
-      changeStateToThen(STATE_DEFAULT, STATE_DEFAULT);
+    currentBrightness = stripFadeFromTo(currentBrightness, stateBrightness(next));
+    if (currentBrightness == stateBrightness(next)) {
+      changeStateToThen(next, next);
     }
   }  
   
   if (state == STATE_ON) {
     if (zButtonPressDownEvent()) {
-      changeStateToThen(STATE_FADING_DOWN, STATE_DEFAULT);
+      changeStateToThen(STATE_FADING_DOWN, STATE_IDLE);
     } else {
-      if (second() > LIGHTS_ON_SECONDS)
+      onCounter++;
+      if (onCounter >= LIGHTS_ON_PERIOD)
         changeStateToThen(STATE_FADING_DOWN, STATE_DEFAULT);
     }
   }
 
   //chuckDebug();
-  
-
-  if (hour() >= 12)
-    changeStateToThen(STATE_OFF, STATE_OFF);
 
   delay(LOOP_DELAYms);
   loopCounter++;
   updateLEDs();
 }
 
+/* ----------------------------------------- */
+
+void RestoreFromEEPROM() {
+
+  state = EEPROM.read(eeStateAddr);
+  next = EEPROM.read(eeNextStateAddr);
+  last = state;
+  currentBrightness = EEPROM.read(eeCurrBrightnessAddr);
+  
+  if (state < 0 || state > STATE_MAX_STATE) {
+    state = STATE_DEFAULT;
+    next = STATE_DEFAULT;
+    currentBrightness = BRIGHTNESS_DEFAULT;
+  }
+}
+
 void changeStateToThen(int newState, int nextState) {
 
-  Serial.print("State: "); 
+  Serial.print(stateName(state));
+  Serial.print(" >> ");
   Serial.print(stateName(newState));
   Serial.print(" >> ");
   if (newState != nextState) {
@@ -165,8 +211,14 @@ void changeStateToThen(int newState, int nextState) {
   } else {
     Serial.println("... waiting");
   }
+  
+  last = state;
   state = newState;
   next = nextState;
+  targetBrightness = stateBrightness(nextState);
+  EEPROM.write(eeStateAddr, state);
+  EEPROM.write(eeNextStateAddr, next);
+  EEPROM.commit();
 }
 
 String stateName(int state) {
@@ -176,7 +228,22 @@ String stateName(int state) {
     case STATE_IDLE:        return "IDLE";        break;
     case STATE_FADING_UP:   return "FADING_UP";   break;
     case STATE_FADING_DOWN: return "FADING_DOWN"; break;
-    default:      return "stateName:  ERROR NOT FOUND (" + String(state) + ")";  break;
+    default:      
+      return "stateName:  ERROR NOT FOUND (" + String(state) + ")";  
+      break;
+  }
+}
+
+int stateBrightness(int state) {
+  switch (state) {
+    case STATE_OFF:         return BRIGHTNESS_OFF;    break;
+    case STATE_ON:          return BRIGHTNESS_ON;     break;
+    case STATE_IDLE:        return BRIGHTNESS_IDLE;   break;
+    case STATE_FADING_UP:   return BRIGHTNESS_OFF;    break;
+    case STATE_FADING_DOWN: return BRIGHTNESS_IDLE;   break;
+    default:      
+      return -1;  
+      break;
   }
 }
 
@@ -207,7 +274,7 @@ void redStrip(int brightness) {
 
   for (i=0; i < strip.numPixels(); i++) {
       strip.setPixelColor(i, strip.Color(brightness, 0, 0));
-      strip.show();
+      strip.show(); 
   }  
 }
 
@@ -216,24 +283,15 @@ void updateLEDs() {
   redStrip(currentBrightness);
 }
 
-int stripFadeUp(int brightness, int targetBrightness) {
-
-  if (brightness < targetBrightness) {
-    redStrip(brightness++);
-    //delay(FADE_UP_DELAYms);
-    return brightness;
+int stripFadeFromTo(int from, int to) {
+  if (from < to) {
+    redStrip(from++);
+  } else {
+    redStrip(from--);
   }
-  return brightness;
-}
-
-int stripFadeDown(int brightness) {
-
-  if (brightness > 0) {
-    redStrip(brightness--);
-    //delay(FADE_DOWN_DELAYms);
-    return brightness;
-  }
-  return brightness;
+  EEPROM.write(eeCurrBrightnessAddr, from);
+  EEPROM.commit();
+  return from;
 }
 
 void chuckDebug() {
