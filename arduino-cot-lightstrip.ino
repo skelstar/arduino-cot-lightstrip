@@ -1,6 +1,7 @@
 #include <myWifiHelper.h>
 #include "LPD8806.h"
 #include "SPI.h"
+#include <myPushButton.h>
 
 /*------------------------------------------------------------------*/
 
@@ -10,10 +11,11 @@
 
 #define FEEDBOTTLE_FEED  "/dev/bottleFeed"
 #define HHmm_FEED        "/dev/HHmm"
-#define WIFI_OTA_NAME   "arduino-cot-lightstrip"
-#define WIFI_HOSTNAME   "arduino-cot-lightstrip"
+#define WIFI_OTA_NAME   "arduino-cot-lightstrip-dev"
+#define WIFI_HOSTNAME   "arduino-cot-lightstrip-dev"
 
 #define MQTTFEED_COT_BRIGHTNESS	"/dev/cot-brightness"
+#define MQTTFEED_COT_BRIGHTNESS_REQUEST "/dev/cot-brightness-request"
 
 char versionText[] = "arduino-cot-lightstrip v0.9.0";
 
@@ -36,15 +38,28 @@ bool updateLeds;
 /*------------------------------------------------------------------*/
 
 void brightness_callback(byte* payload, unsigned int length) {
-	if (length == 1) {
-		currentBrightness = payload[0];
-	} else if (length == 2) {
-		currentBrightness = payload[0]*10;
-		currentBrightness += payload[1];
-	}
+
+	currentBrightness = payload[0] - '0';
 	Serial.print("Brightness set to: "); Serial.println(currentBrightness);
 	updateLeds = true;
 }
+
+
+#define BUTTON_PIN	0
+#define BUTTON 		0
+#define LEDS 		1
+
+void listener_Button(int eventCode, int eventParams);
+#define LONG_PRESS_TIME	2000
+
+myPushButton button(BUTTON_PIN, true, LONG_PRESS_TIME, 1, listener_Button);
+
+void listener_Button(int eventCode, int eventParams) {
+	if (eventParams == button.EV_RELEASED) {
+    	wifiHelper.mqttPublish(MQTTFEED_COT_BRIGHTNESS_REQUEST, "0");
+	}
+}
+
 
 /*------------------------------------------------------------------*/
 
@@ -72,22 +87,47 @@ void setup() {
     wifiHelper.setupMqtt();
 
     wifiHelper.mqttAddSubscription(MQTTFEED_COT_BRIGHTNESS, brightness_callback);
+
+	wifiHelper.loopMqttNonBlocking();
+
+	delay(1000);
+
+    wifiHelper.mqttPublish(MQTTFEED_COT_BRIGHTNESS_REQUEST, "0");
 }
 
 void loop() {
 
+    // need this for both subscribing and publishing
+    if (!wifiHelper.loopMqttNonBlocking()) {
+        Serial.print('.');
+    }
+
     ArduinoOTA.handle();
 
+    button.serviceEvents();
+
     if (updateLeds) {
+    	changePinFunc(LEDS);
 		uint32_t red = strip.Color(currentBrightness, 0, 0);
 		for (int i=0; i<strip.numPixels(); i++) {
 			strip.setPixelColor(i, red);
 		}
 		strip.show();
 		updateLeds = false;
+		delay(50);
+		changePinFunc(BUTTON);
     }
 
     delay(50);
 }
 
 /* ----------------------------------------- */
+
+void changePinFunc(int func) {
+	if (func == BUTTON) {
+		pinMode(BUTTON_PIN, INPUT_PULLUP);
+	}
+	else if (func == LEDS) {
+		pinMode(BUTTON_PIN, OUTPUT);
+	}
+}
